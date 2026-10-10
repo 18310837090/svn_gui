@@ -1,0 +1,6 @@
+svn-gui (1.0.0) jammy; urgency=medium
+
+  * Initial Debian package: PySide6 layered architecture (core + ui).
+  * Bundles a trimmed PySide6 runtime (QtCore/QtGui/QtWidgets/Network).
+
+ -- tko <tko@localhost>  Mon, 06 Oct 2025 10:00:00 +0800
