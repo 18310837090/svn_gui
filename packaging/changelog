@@ -1,3 +1,14 @@
+svn-gui (1.0.2) jammy; urgency=medium
+
+  * 修复提交说明输入框无法使用输入法（只能输入英文）的问题：
+    打包时误删了 Qt 的 platforminputcontexts 插件目录，导致只回退到
+    内置 XIM，ibus 环境下中文无法输入。
+  * 保留 libibusplatforminputcontextplugin（仅裁掉依赖 QtQuick 的虚拟键盘插件）。
+  * 启动器按会话自动设置 QT_IM_MODULE（fcitx/ibus），并强制 xcb 平台。
+  * 打包时校验 ibus 插件存在，缺失则中止。
+
+ -- tko <tko@localhost>  Thu, 06 Nov 2025 17:10:00 +0800
+
 svn-gui (1.0.0) jammy; urgency=medium
 
   * Initial Debian package: PySide6 layered architecture (core + ui).

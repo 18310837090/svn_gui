@@ -79,6 +79,31 @@ class SvnRepo:
             return self._status_text()
         return self._relativize(items)
 
+    def list_versioned(self) -> list:
+        """工作副本内所有已受控文件的相对路径（含无变更的），用于挂文件监视。
+        必须用 status -v：不带 -v 只输出有变更的条目。
+        未版本控制(?)/被忽略(I)/外部(X) 以及目录都不返回。"""
+        out = self._run(["status", "-v", "--xml", self.path], timeout=180)
+        try:
+            root = ET.fromstring(out)
+        except ET.ParseError:
+            return []
+        paths = []
+        for target in root.findall("target"):
+            for entry in target.findall("entry"):
+                p = entry.get("path", "")
+                wc = entry.find("wc-status")
+                if not p or wc is None:
+                    continue
+                if wc.get("item") in ("unversioned", "ignored", "external", "none"):
+                    continue
+                # 目录的 item 是 "normal" 且不可取 kind，靠文件系统判断
+                if os.path.isdir(os.path.join(self.path, p)):
+                    continue
+                paths.append(p)
+        return [it.path for it in self._relativize(
+            [StatusItem(path=p, code="") for p in paths])]
+
     def _relativize(self, items):
         """把绝对路径归一为相对 self.path 的路径"""
         if not items:

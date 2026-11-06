@@ -45,9 +45,15 @@ cd plugins
 rm -rf sceneparsers assetimporters qmltooling geoservices canbus position sensors \
        texttospeech webview sqldrivers multimedia renderers renderplugins \
        geometryloaders scxmldatamodel designer qmllint vectorimageformats \
-       wayland-* egldeviceintegrations platforminputcontexts printsupport generic
+       wayland-* egldeviceintegrations printsupport generic
 rm -f platforms/libqeglfs.so platforms/libqwayland* \
       imageformats/libqpdf.so imageformats/libqsvg.so iconengines/libqsvgicon.so
+
+# 输入法插件必须保留：裁掉后 Qt 只剩内置 XIM，ibus/fcitx 下无法输入中文
+cd platforminputcontexts
+rm -f libqtvirtualkeyboardplugin.so          # 依赖 QtQuick/Qml，已裁掉
+[[ -f libibusplatforminputcontextplugin.so ]] || { echo "缺少 ibus 输入法插件，中止"; exit 1; }
+cd ..
 
 # 共享库：只留 Core/Gui/Widgets/Network/XcbQpa/DBus/OpenGL/ICU
 cd ../lib
@@ -76,6 +82,23 @@ cat > "$WORK/svn-gui-launcher" <<EOF
 #!/bin/sh
 # svn-gui: 使用内置 PySide6 (/usr/lib/svn-gui/vendor)
 APP_DIR=/usr/lib/svn-gui
+# 强制 xcb：内置 Qt 只带 xcb 平台插件
+export QT_QPA_PLATFORM=xcb
+# 输入法：跟随会话中实际运行的输入法框架，避免 Qt 选错插件而无法输入中文
+if [ -z "\$QT_IM_MODULE" ]; then
+    case "\$XMODIFIERS" in
+        *fcitx*) QT_IM_MODULE=fcitx ;;
+        *ibus*)  QT_IM_MODULE=ibus ;;
+        *)
+            if pgrep -x fcitx5 >/dev/null 2>&1 || pgrep -x fcitx >/dev/null 2>&1; then
+                QT_IM_MODULE=fcitx
+            elif pgrep -x ibus-daemon >/dev/null 2>&1; then
+                QT_IM_MODULE=ibus
+            fi ;;
+    esac
+    export QT_IM_MODULE
+fi
+# 内置 Qt 自带的 ibus 插件（DBus 实现，无需 ibus-qt 扩展）
 exec python3 -c "import sys; sys.path.insert(0, '\$APP_DIR/vendor'); sys.path.insert(0, '\$APP_DIR'); sys.argv[0]='svn-gui'; import runpy; runpy.run_module('svn_gui', run_name='__main__')" "\$@"
 EOF
 install -m 755 "$WORK/svn-gui-launcher" "$ROOT/usr/bin/svn-gui"

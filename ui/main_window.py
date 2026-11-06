@@ -148,11 +148,15 @@ class MainWindow(QMainWindow):
         self._active_dir = None    # 目录过滤 (None = 全部)
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_fs_changed)
+        # 目录监视只能感知新建/删除/重命名；在外部编辑器里“修改已有文件内容”
+        # 只会触发 fileChanged，不监视文件本身的话状态永远不会自动刷新
+        self._fs_watcher.fileChanged.connect(self._on_fs_changed)
         self._fs_timer = QTimer(self)
         self._fs_timer.setSingleShot(True)
         self._fs_timer.setInterval(600)   # 防抖: 批量文件操作只触发一次刷新
         self._fs_timer.timeout.connect(self.refresh)
         self._watched_paths = set()
+        self._versioned_files = []   # 已受控文件相对路径，供文件监视使用
 
         self._apply_theme()
         self._build_ui()
@@ -208,6 +212,7 @@ class MainWindow(QMainWindow):
         self.dir_tree.setHeaderHidden(True)
         self.dir_tree.setColumnCount(2)
         self.dir_tree.setRootIsDecorated(True)
+        self.dir_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.dir_tree.itemClicked.connect(self._on_tree_click)
         self.dir_tree.itemDoubleClicked.connect(self._on_tree_dclick)
         self.dir_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -391,6 +396,7 @@ class MainWindow(QMainWindow):
         "commit":      ("提交…", "Ctrl+Return", "on_commit"),
         "quit":        ("退出", "Ctrl+Q", "close"),
         "add":         ("添加未版本控制文件…", "", "on_add"),
+        "delete":      ("删除选中文件…", "Delete", "on_delete"),
         "ignore":      ("加入忽略清单 (svn:ignore)…", "", "on_ignore"),
         "cleanup":     ("清理 (cleanup)", "", "on_cleanup"),
         "resolve":     ("解决冲突…", "", "on_resolve"),
@@ -465,6 +471,7 @@ class MainWindow(QMainWindow):
         m_svn.addAction(self._bind_action("commit"))
         m_svn.addSeparator()
         m_svn.addAction(self._bind_action("add"))
+        m_svn.addAction(self._bind_action("delete"))
         m_svn.addAction(self._bind_action("ignore"))
         m_svn.addSeparator()
         m_svn.addAction(self._bind_action("cleanup"))
@@ -743,27 +750,35 @@ class MainWindow(QMainWindow):
     # ---------- 刷新 ----------
 
     def _watch_dirs(self):
-        """监视工作副本根目录（及前两层子目录），文件变动时自动刷新目录树。
-        只监视目录（svn status 才能感知文件级变更），不监视 .svn 内部。"""
+        """监视工作副本根目录 + 前两层子目录，以及已受控文件本身。
+        目录监视感知 新建/删除/重命名；文件监视感知 已有文件被改写
+        （编辑器保存走的正是后者），两者缺一状态就会停在旧值。"""
         w = self._fs_watcher
-        old = set(w.directories())
+        old = set(w.directories()) | set(w.files())
         if old:
             w.removePaths(list(old))
         self._watched_paths = set()
         if not self.repo or not os.path.isdir(self.repo.path):
             return
+
+        def watch(directory, depth):
+            if directory in self._watched_paths:
+                return
+            w.addPath(directory)
+            self._watched_paths.add(directory)
+            if depth >= 2:
+                return
+            for sub in self._list_dirs(directory):
+                watch(os.path.join(directory, sub), depth + 1)
+
         root = self.repo.path
-        w.addPath(root)
-        self._watched_paths.add(root)
-        for d in self._list_dirs(root):
-            p = os.path.join(root, d)
-            if p not in self._watched_paths:
-                w.addPath(p)
-                self._watched_paths.add(p)
-            for sub in self._list_dirs(p):
-                sp = os.path.join(p, sub)
-                w.addPath(sp)
-                self._watched_paths.add(sp)
+        watch(root, 0)
+        # 文件清单来自后台取到的 status（_on_status 传进来），
+        # 不在这里再跑一次 svn status，否则每次刷新都会卡 UI
+        files = [os.path.join(root, p) for p in self._versioned_files
+                 if os.path.isfile(os.path.join(root, p))]
+        if files:
+            w.addPaths(files)
 
     @staticmethod
     def _list_dirs(path):
@@ -781,15 +796,26 @@ class MainWindow(QMainWindow):
         if not self.repo:
             return
         self.set_status("正在获取状态…")
-        repo = self.repo
         self.runner.run(
-            repo.status,
-            on_result=self._on_status,
+            self._status_work,
+            on_result=lambda r: self._on_status(*r),
             on_error=lambda e: self.alert("刷新失败", str(e)),
         )
 
-    def _on_status(self, items):
+    def _status_work(self):
+        """后台线程：一次取回 变更列表 + 已受控文件清单（供文件监视用）"""
+        repo = self.repo
+        items = repo.status()
+        try:
+            versioned = repo.list_versioned()
+        except Exception:
+            versioned = [it.path for it in items if it.code != "?"]
+        return items, versioned
+
+    def _on_status(self, items, versioned=None):
         self.items = items
+        self._versioned_files = versioned if versioned is not None else \
+            [it.path for it in items if it.code != "?"]
         self._rebuild_tree()
         self._rebuild_file_list()
         self.summary_page.update_info(self.repo, items)
@@ -946,6 +972,10 @@ class MainWindow(QMainWindow):
         item = self.dir_tree.itemAt(pos)
         if not item:
             return
+        # 右键点在已选中的节点上 → 保留多选（供批量删除）；点在别处 → 只选该节点
+        if not item.isSelected():
+            self.dir_tree.clearSelection()
+            item.setSelected(True)
         fs_path = self._tree_node_fs_path(item)
         if not fs_path:
             return
@@ -957,7 +987,57 @@ class MainWindow(QMainWindow):
             if data is not None:
                 menu.addAction("打开文件", lambda: self._show_in_code_view(data))
         menu.addAction("打开原始路径", lambda: self._open_fs_path(fs_path))
+        menu.addSeparator()
+        targets = self._tree_selected_paths()
+        if targets:
+            n = len(targets)
+            label = "删除" if n == 1 else f"删除 ({n} 项)"
+            act_del = menu.addAction(label, self._delete_tree_selection)
+            # 根节点 / 无版本控制的内容无法 svn delete
+            act_del.setEnabled(all(t.endswith("/") or self._is_versioned(t)
+                                   for t in targets))
+        else:
+            menu.addAction("删除").setEnabled(False)
         menu.exec(self.dir_tree.viewport().mapToGlobal(pos))
+
+    def _tree_selected_paths(self):
+        """目录树当前选中的路径（相对工作副本根，目录以 / 结尾）。
+        子节点已被所选目录覆盖时不再重复收集；根节点不参与。"""
+        if not self.repo:
+            return []
+        sel = [it for it in self.dir_tree.selectedItems() if it.parent() is not None]
+        if not sel:
+            return []
+        # 选中项 → (节点, 文件系统路径, 是否目录)
+        info = []
+        for it in sel:
+            fs = self._tree_node_fs_path(it)
+            if fs:
+                info.append((it, fs, os.path.isdir(fs)))
+        dir_nodes = [n for n, _, is_dir in info if is_dir]
+        out = []
+        for node, fs, is_dir in info:
+            covered = False
+            p = node.parent()
+            while p is not None:
+                if p in dir_nodes:
+                    covered = True
+                    break
+                p = p.parent()
+            if covered:
+                continue
+            rel = os.path.relpath(fs, self.repo.path).replace(os.sep, "/")
+            out.append(rel + "/" if is_dir else rel)
+        return out
+
+    def _is_versioned(self, rel_path):
+        """相对路径是否已纳入版本控制（未版本控制的 ? 文件不能 svn delete）。
+        不在 status 列表里的路径按已受控处理，交给 svn delete 报错。"""
+        p = rel_path.rstrip("/")
+        for it in self.items:
+            if it.path == p:
+                return it.code != "?"
+        return True
 
     def _toggle_tree_node(self, item):
         """目录树节点折叠/展开切换"""
@@ -1173,7 +1253,21 @@ class MainWindow(QMainWindow):
         )
 
     def on_commit(self):
-        if not self.repo or not self.items:
+        if not self.repo:
+            return
+        # 提交前重新取一次状态：内存里的 items 可能已过时（文件在外部被改、
+        # 或文件监视没覆盖到），否则会出现"明明改了却说没有可提交的变更"
+        self.set_status("正在获取状态…")
+        self.runner.run(
+            self._status_work,
+            on_result=lambda r: self._on_commit_status(*r),
+            on_error=lambda e: self.alert("提交", f"获取状态失败：\n{e}"),
+        )
+
+    def _on_commit_status(self, items, versioned=None):
+        # 用刚拿到的状态刷新界面，保证弹窗里的清单与磁盘一致
+        self._on_status(items, versioned)
+        if not items:
             self.alert("提交", "没有可提交的变更", error=False)
             return
         # 只提交当前过滤/目录范围内可见的文件，与列表显示保持一致
@@ -1181,8 +1275,7 @@ class MainWindow(QMainWindow):
             self.alert("提交", "当前过滤条件下没有可提交的变更", error=False)
             return
         from .pages.commit_page import CommitPage
-        repo = self.repo
-        dlg = CommitPage(self, list(self.items), repo, self.theme)
+        dlg = CommitPage(self, list(items), self.repo, self.theme)
         dlg.exec()
         if dlg.committed_rev:
             self.set_status(f"提交成功 → r{dlg.committed_rev}")
@@ -1204,6 +1297,41 @@ class MainWindow(QMainWindow):
             lambda: repo.add(paths),
             on_result=lambda _: self._after_write("添加"),
             on_error=lambda e: self._after_fail("添加", e),
+        )
+
+    def on_delete(self):
+        """SVN 菜单 / Delete 键：删除目录树或文件列表里选中的内容"""
+        paths = self._tree_selected_paths() or [it.path for it in self._selected_items()]
+        if not paths:
+            self.alert("删除", "请先在目录树或文件列表里选中要删除的文件", error=False)
+            return
+        self._svn_delete(paths)
+
+    def _delete_tree_selection(self):
+        """目录树右键菜单 → 删除"""
+        self._svn_delete(self._tree_selected_paths())
+
+    def _svn_delete(self, paths):
+        if not self.repo or not paths:
+            return
+        unversioned = [p for p in paths if not p.endswith("/") and not self._is_versioned(p)]
+        if unversioned:
+            names = "\n".join(unversioned[:10]) + ("\n…" if len(unversioned) > 10 else "")
+            self.alert("删除", f"以下路径未纳入版本控制，不能 svn delete：\n\n{names}\n\n"
+                               "如需删除请直接在文件管理器里操作。")
+            return
+        names = "\n".join(paths[:12]) + ("\n…" if len(paths) > 12 else "")
+        if not self.confirm("svn delete",
+                            f"确定删除以下 {len(paths)} 项？\n\n{names}\n\n"
+                            "文件会从磁盘移除，并在 SVN 中标记为待删除；\n"
+                            "下次提交时才会从仓库中删除。"):
+            return
+        repo = self.repo
+        self.set_status(f"正在删除 {len(paths)} 项…")
+        self.runner.run(
+            lambda: repo.delete(paths),
+            on_result=lambda _: self._after_write("删除"),
+            on_error=lambda e: self._after_fail("删除", e),
         )
 
     def _do_revert(self, items):
@@ -1361,6 +1489,7 @@ class MainWindow(QMainWindow):
         self.alert("快捷键",
                    "\n".join(lines) +
                    "\n\n文件右键: Diff / Blame / 添加 / 还原 / 解决冲突 / 忽略\n"
+                   "目录树右键: 打开 / 删除 (svn delete，支持多选)\n"
                    "双击文件: 查看 Diff\n\n"
                    "快捷键可在 文件 → 快捷键 中自定义",
                    error=False)
